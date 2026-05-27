@@ -522,10 +522,46 @@ fn validate_job_input(env: &Env, job_id: u64, hash: &Bytes, budget: i128) {
 }
 
 fn validate_hash(env: &Env, hash: &Bytes) {
+    validate_ipfs_cid(env, hash);
+}
+
+fn validate_ipfs_cid(env: &Env, hash: &Bytes) {
     let len = hash.len();
-    if len == 0 || len > MAX_HASH_LEN {
+    if len == 46 {
+        // Must be CIDv0 (Qm...)
+        let mut buf = [0u8; 46];
+        hash.copy_into_slice(&mut buf);
+        if buf[0] != b'Q' || buf[1] != b'm' {
+            panic_with_error!(env, JobRegistryError::InvalidHash);
+        }
+        for i in 2..46 {
+            if !is_valid_base58_char(buf[i]) {
+                panic_with_error!(env, JobRegistryError::InvalidHash);
+            }
+        }
+    } else if len == 59 {
+        // Must be CIDv1 (bafy...)
+        let mut buf = [0u8; 59];
+        hash.copy_into_slice(&mut buf);
+        if buf[0] != b'b' || buf[1] != b'a' || buf[2] != b'f' || buf[3] != b'y' {
+            panic_with_error!(env, JobRegistryError::InvalidHash);
+        }
+        for i in 4..59 {
+            if !is_valid_base32_char(buf[i]) {
+                panic_with_error!(env, JobRegistryError::InvalidHash);
+            }
+        }
+    } else {
         panic_with_error!(env, JobRegistryError::InvalidHash);
     }
+}
+
+fn is_valid_base58_char(c: u8) -> bool {
+    matches!(c, b'1'..=b'9' | b'A'..=b'H' | b'J'..=b'N' | b'P'..=b'Z' | b'a'..=b'k' | b'm'..=b'z')
+}
+
+fn is_valid_base32_char(c: u8) -> bool {
+    matches!(c, b'a'..=b'z' | b'2'..=b'7')
 }
 
 fn post_job_with_id(
@@ -617,7 +653,7 @@ mod test {
     #[should_panic]
     fn test_post_job_before_initialize_panics() {
         let (env, cc, _admin, client, _, token_addr) = setup();
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         cc.post_job(&1u64, &client, &hash, &5000i128, &2000u64, &token_addr, &1000i128);
     }
 
@@ -626,8 +662,8 @@ mod test {
         let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash1 = Bytes::from_slice(&env, b"QmHash1");
-        let hash2 = Bytes::from_slice(&env, b"QmHash2");
+        let hash1 = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
+        let hash2 = Bytes::from_slice(&env, b"QmY4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9e");
 
         env.ledger().set_timestamp(100);
 
@@ -644,7 +680,7 @@ mod test {
         let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         env.ledger().set_timestamp(100);
         cc.post_job(&42u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
 
@@ -657,7 +693,7 @@ mod test {
         let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         env.ledger().set_timestamp(100);
         cc.post_job(&1u64, &client, &hash, &0i128, &1000u64, &token_addr, &1000i128);
     }
@@ -678,7 +714,7 @@ mod test {
         let (env, cc, admin, client, freelancer, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmSomeIPFSHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         env.ledger().set_timestamp(100);
         cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
 
@@ -690,7 +726,7 @@ mod test {
         assert_eq!(job.freelancer, None);
         assert!(job.collateral_locked);
 
-        let proposal = Bytes::from_slice(&env, b"QmProposalHash");
+        let proposal = Bytes::from_slice(&env, b"QmProposalHashValid123456789012345678901234567");
         cc.submit_bid(&1u64, &freelancer, &proposal);
 
         let bids = cc.get_bids(&1u64);
@@ -701,7 +737,7 @@ mod test {
         assert_eq!(job.status, JobStatus::Assigned);
         assert_eq!(job.freelancer, Some(freelancer.clone()));
 
-        let deliverable = Bytes::from_slice(&env, b"QmDeliverableHash");
+        let deliverable = Bytes::from_slice(&env, b"QmDeliverableHashValid123456789012345678901234");
         cc.submit_deliverable(&1u64, &freelancer, &deliverable);
 
         let job = cc.get_job(&1u64);
@@ -723,11 +759,11 @@ mod test {
         let (env, cc, admin, client, freelancer, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         env.ledger().set_timestamp(100);
         cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
 
-        let proposal = Bytes::from_slice(&env, b"QmProposal");
+        let proposal = Bytes::from_slice(&env, b"QmProposalHashValid123456789012345678901234567");
         cc.submit_bid(&1u64, &freelancer, &proposal);
         cc.submit_bid(&1u64, &freelancer, &proposal);
     }
@@ -738,7 +774,7 @@ mod test {
         let (env, cc, admin, client, freelancer, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         env.ledger().set_timestamp(100);
         cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
 
@@ -750,11 +786,11 @@ mod test {
         let (env, cc, admin, client, freelancer, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         env.ledger().set_timestamp(100);
         cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
 
-        let proposal = Bytes::from_slice(&env, b"QmProposal");
+        let proposal = Bytes::from_slice(&env, b"QmProposalHashValid123456789012345678901234567");
         cc.submit_bid(&1u64, &freelancer, &proposal);
         cc.accept_bid(&1u64, &client, &freelancer);
 
@@ -769,7 +805,7 @@ mod test {
         let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         env.ledger().set_timestamp(100);
         cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
 
@@ -782,7 +818,7 @@ mod test {
         let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         env.ledger().set_timestamp(100);
         cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
 
@@ -795,12 +831,12 @@ mod test {
         let (env, cc, admin, client, freelancer, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         env.ledger().set_timestamp(100);
         cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
 
         env.ledger().set_timestamp(1001); // past the deadline of 1000
-        let proposal = Bytes::from_slice(&env, b"QmProposal");
+        let proposal = Bytes::from_slice(&env, b"QmProposalHashValid123456789012345678901234567");
         cc.submit_bid(&1u64, &freelancer, &proposal);
     }
 
@@ -809,7 +845,7 @@ mod test {
         let (env, cc, admin, client, _, token_addr) = setup();
         cc.initialize(&admin);
 
-        let hash = Bytes::from_slice(&env, b"QmHash");
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
         env.ledger().set_timestamp(100);
         cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
 
@@ -822,5 +858,75 @@ mod test {
         let job = cc.get_job(&1u64);
         assert!(!job.collateral_locked);
         assert_eq!(tc.balance(&client), 100000);
+    }
+
+    #[test]
+    fn test_valid_cidv1_posting() {
+        let (env, cc, admin, client, _, token_addr) = setup();
+        cc.initialize(&admin);
+
+        let hash = Bytes::from_slice(&env, b"bafybeigdyrzt5sbi7ee3xjc3vyqptsyfuwwspw2gx6pqdfaaaaabbbbbccccc");
+        env.ledger().set_timestamp(100);
+        cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
+
+        let job = cc.get_job(&1u64);
+        assert_eq!(job.metadata_hash, hash);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_invalid_cid_length_panics() {
+        let (env, cc, admin, client, _, token_addr) = setup();
+        cc.initialize(&admin);
+
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f123");
+        env.ledger().set_timestamp(100);
+        cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_invalid_cidv0_prefix_panics() {
+        let (env, cc, admin, client, _, token_addr) = setup();
+        cc.initialize(&admin);
+
+        let hash = Bytes::from_slice(&env, b"QxZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a9f");
+        env.ledger().set_timestamp(100);
+        cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_invalid_cidv1_prefix_panics() {
+        let (env, cc, admin, client, _, token_addr) = setup();
+        cc.initialize(&admin);
+
+        let hash = Bytes::from_slice(&env, b"bafxbeigdyrzt5sbi7ee3xjc3vyqptsyfuwwspw2gx6pqdfaaaaabbbbbccccc");
+        env.ledger().set_timestamp(100);
+        cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_invalid_cidv0_chars_panics() {
+        let (env, cc, admin, client, _, token_addr) = setup();
+        cc.initialize(&admin);
+
+        // '0' is invalid in base58
+        let hash = Bytes::from_slice(&env, b"QmZ4t45v9y2X6a9f5d3v2X5a9f5d3v2X5a9f5d3v2X5a0f");
+        env.ledger().set_timestamp(100);
+        cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_invalid_cidv1_chars_panics() {
+        let (env, cc, admin, client, _, token_addr) = setup();
+        cc.initialize(&admin);
+
+        // '0' is invalid in base32
+        let hash = Bytes::from_slice(&env, b"bafybeigdyrzt5sbi7ee3xjc3vyqptsyfuwwspw2gx6pqdfaaaaabbbbbcccc0");
+        env.ledger().set_timestamp(100);
+        cc.post_job(&1u64, &client, &hash, &5000i128, &1000u64, &token_addr, &1000i128);
     }
 }
