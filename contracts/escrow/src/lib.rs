@@ -47,6 +47,7 @@ impl EscrowStatus {
             (EscrowStatus::WorkInProgress, EscrowStatus::Disputed) => Ok(()),
             (EscrowStatus::WorkInProgress, EscrowStatus::Refunded) => Ok(()),
             (EscrowStatus::Disputed, EscrowStatus::Resolved) => Ok(()),
+            (EscrowStatus::Disputed, EscrowStatus::Refunded) => Ok(()),
             _ => Err(EscrowError::InvalidStateTransition),
         }
     }
@@ -2398,7 +2399,7 @@ mod test {
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #8)")]
+    #[should_panic(expected = "Error(Contract, #6)")]
     fn test_double_release_milestone_is_blocked() {
         let env = Env::default();
         env.mock_all_auths();
@@ -2420,7 +2421,8 @@ mod test {
         cc.deposit(&1u64, &5000i128);
 
         cc.release_milestone(&1u64, &client);
-        cc.release_milestone(&1u64, &client); // NoPendingMilestones (#8)
+        // Job is now Completed; status guard fires first -> InvalidState (#6)
+        cc.release_milestone(&1u64, &client);
     }
 
     #[test]
