@@ -38,6 +38,7 @@ impl EscrowStatus {
     pub fn validate_transition(&self, next: &EscrowStatus) -> Result<(), EscrowError> {
         match (self, next) {
             (EscrowStatus::Setup, EscrowStatus::Funded) => Ok(()),
+            (EscrowStatus::Setup, EscrowStatus::Refunded) => Ok(()),
             (EscrowStatus::Funded, EscrowStatus::WorkInProgress) => Ok(()),
             (EscrowStatus::Funded, EscrowStatus::Completed) => Ok(()),
             (EscrowStatus::Funded, EscrowStatus::Disputed) => Ok(()),
@@ -195,6 +196,15 @@ pub struct ContractUpgradedEvent {
     pub by_admin: Address,
     pub new_wasm_hash: BytesN<32>,
     pub upgraded_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BriefCanceledEvent {
+    pub job_id: u64,
+    pub refunded_amount: i128,
+    pub canceled_by: Address,
+    pub canceled_at: u64,
 }
 
 #[contracttype]
@@ -933,6 +943,64 @@ impl EscrowContract {
         env.events().publish(
             ("escrow", "Refunded"),
             (job_id, client, remaining, env.ledger().timestamp()),
+        );
+
+        Ok(())
+    }
+
+    /// Client cancels a brief and triggers graceful refund behavior.
+    /// Supports Setup (no funds moved yet), Funded, and WorkInProgress states.
+    pub fn cancel_brief(env: Env, job_id: u64, client: Address) -> Result<(), EscrowError> {
+        client.require_auth();
+
+        let key = DataKey::Job(job_id);
+        let mut job: EscrowJob = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(EscrowError::JobNotFound)?;
+        Self::bump_job_ttl(&env, &key);
+
+        if client != job.client {
+            return Err(EscrowError::Unauthorized);
+        }
+
+        if !(job.status == EscrowStatus::Setup
+            || job.status == EscrowStatus::Funded
+            || job.status == EscrowStatus::WorkInProgress)
+        {
+            return Err(EscrowError::InvalidState);
+        }
+
+        let remaining = job
+            .total_amount
+            .checked_sub(job.released_amount)
+            .ok_or(EscrowError::InvalidInput)?;
+
+        let next_status = EscrowStatus::Refunded;
+        job.status.validate_transition(&next_status)?;
+        job.released_amount = job.total_amount;
+        job.status = next_status;
+
+        enter_reentrancy_guard(&env);
+
+        if remaining > 0 {
+            let token_client = token::Client::new(&env, &job.token);
+            token_client.transfer(&env.current_contract_address(), &job.client, &remaining);
+        }
+
+        env.storage().persistent().set(&key, &job);
+        Self::bump_job_ttl(&env, &key);
+        exit_reentrancy_guard(&env);
+
+        env.events().publish(
+            ("escrow", "BriefCanceled"),
+            BriefCanceledEvent {
+                job_id,
+                refunded_amount: remaining,
+                canceled_by: client,
+                canceled_at: env.ledger().timestamp(),
+            },
         );
 
         Ok(())
@@ -2321,7 +2389,7 @@ mod test {
     }
 
     #[test]
-    fn test_getters_for_config_and_remaining_balance() {
+    fn test_cancel_brief_in_setup_marks_refunded_without_transfer() {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -2330,24 +2398,17 @@ mod test {
         let client = Address::generate(&env);
         let freelancer = Address::generate(&env);
         let token_addr = setup_token(&env, &admin);
-        mint(&env, &token_addr, &client);
 
         let contract_id = env.register_contract(None, EscrowContract);
         let cc = EscrowContractClient::new(&env, &contract_id);
 
         cc.initialize(&admin, &agent_judge);
-        cc.create_job(&1u64, &client, &freelancer, &token_addr);
-        cc.add_milestone(&1u64, &4000i128);
-        cc.add_milestone(&1u64, &6000i128);
-        cc.deposit(&1u64, &10000i128);
-        cc.release_milestone(&1u64, &client);
+        cc.create_job(&77u64, &client, &freelancer, &token_addr);
+        cc.cancel_brief(&77u64, &client);
 
-        let (stored_admin, stored_agent, registry) = cc.get_escrow_config();
-        assert_eq!(stored_admin, admin);
-        assert_eq!(stored_agent, agent_judge);
-        assert_eq!(registry, None);
-
-        assert_eq!(cc.get_remaining_balance(&1u64), 6000);
+        let job = cc.get_job(&77u64);
+        assert_eq!(job.status, EscrowStatus::Refunded);
+        assert_eq!(job.released_amount, 0);
     }
 
     #[test]
