@@ -11,6 +11,7 @@ import usersRoutes from "./routes/users";
 import activityRoutes from "./routes/activity";
 import uploadsRoutes from "./routes/uploads";
 import bulkRoutes from "./routes/bulk";
+import diagnosticsRoutes from "./routes/diagnostics";
 
 dotenv.config();
 
@@ -31,6 +32,7 @@ app.use("/api/v1/users", usersRoutes);
 app.use("/api/v1/activity", activityRoutes);
 app.use("/api/v1/uploads", uploadsRoutes);
 app.use("/api/v1/bulk", bulkRoutes);
+app.use("/api/v1/diagnostics", diagnosticsRoutes);
 
 // Basic healthcheck route
 app.get("/health", async (req: Request, res: Response) => {
