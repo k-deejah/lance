@@ -46,6 +46,8 @@ pub struct Profile {
     pub freelancer: RoleMetrics,
     pub is_blacklisted: bool,
     pub metadata_hash: Option<Bytes>,
+    /// unix timestamp of last activity that affected reputation (seconds)
+    pub last_activity: u64,
 }
 
 impl Profile {
@@ -56,6 +58,7 @@ impl Profile {
             freelancer: RoleMetrics::new(),
             is_blacklisted: false,
             metadata_hash: None,
+            last_activity: 0,
         }
     }
 }

@@ -47,7 +47,6 @@ pub struct ReputationScore {
     pub total_points: i128,
     pub reviews: u32,
     /// Active badge level
-    pub badge_level: u32,
     pub average_rating_bps: i32,
     pub badge_level: u32,
     pub blacklisted: bool,
@@ -311,6 +310,18 @@ impl ReputationContract {
         Self::refresh_badge(metrics, is_blacklisted);
     }
 
+    fn compute_recovery_towards_default(current: i32, recovery_bps: i32) -> i32 {
+        // Move `current` towards DEFAULT_SCORE_BPS by `recovery_bps` (bps of the gap)
+        let gap = (Self::DEFAULT_SCORE_BPS as i128) - (current as i128);
+        if gap == 0 {
+            return current;
+        }
+        let adj = (gap * (recovery_bps as i128)) / (Self::SCORE_SCALE as i128);
+        let result = (current as i128) + adj;
+        // clamp to valid range
+        Self::clamp_score_i128(result)
+    }
+
     pub fn upgrade(
         env: Env,
         caller: Address,
@@ -457,6 +468,7 @@ impl ReputationContract {
             if target == job.client {
                 let is_blacklisted = profile.is_blacklisted;
                 Self::apply_review(&env, &mut profile.client, score, is_blacklisted);
+                profile.last_activity = env.ledger().timestamp();
                 (
                     Role::Client,
                     profile.client.review.total_points,
@@ -469,6 +481,7 @@ impl ReputationContract {
             } else if job.freelancer.as_ref() == Some(&target) {
                 let is_blacklisted = profile.is_blacklisted;
                 Self::apply_review(&env, &mut profile.freelancer, score, is_blacklisted);
+                profile.last_activity = env.ledger().timestamp();
                 (
                     Role::Freelancer,
                     profile.freelancer.review.total_points,
@@ -524,6 +537,7 @@ impl ReputationContract {
         let metrics = Self::role_metrics_mut(&mut profile, &role);
         let previous_score = metrics.score;
         Self::apply_manual_delta(metrics, delta, is_blacklisted);
+        profile.last_activity = env.ledger().timestamp();
         let new_score = metrics.score;
         let total_jobs = metrics.completed_jobs;
         let badge_level = metrics.badge_level;
@@ -557,6 +571,7 @@ impl ReputationContract {
         let metrics = Self::role_metrics_mut(&mut profile, &role);
         let previous_score = metrics.score;
         Self::apply_role_decay(&env, metrics, Self::SLASH_DECAY_BPS, is_blacklisted);
+        profile.last_activity = env.ledger().timestamp();
         let new_score = metrics.score;
         let total_jobs = metrics.completed_jobs;
         let badge_level = metrics.badge_level;
@@ -591,6 +606,7 @@ impl ReputationContract {
                 Self::BLACKLIST_DECAY_BPS,
                 is_blacklisted,
             );
+            profile.last_activity = env.ledger().timestamp();
         }
 
         let client_score = profile.client.score;
@@ -604,6 +620,57 @@ impl ReputationContract {
                 client_score,
                 freelancer_score,
                 updated_at: env.ledger().timestamp(),
+            },
+        );
+        Self::bump_instance_ttl(&env);
+    }
+
+    /// Recover score for inactive profiles. `lookback_seconds` specifies minimum inactivity
+    /// required to allow recovery. `recovery_bps` is basis-points of the gap towards default.
+    /// Only callable by an authorized contract.
+    pub fn recover_score(
+        env: Env,
+        caller_contract: Address,
+        address: Address,
+        role: Role,
+        lookback_seconds: u64,
+        recovery_bps: i32,
+    ) {
+        Self::require_authorized_contract(&env, &caller_contract);
+
+        if recovery_bps < 0 || recovery_bps > Self::SCORE_SCALE as i32 {
+            soroban_sdk::panic_with_error!(&env, ReputationError::InvalidInput);
+        }
+
+        let mut profile = storage::read_profile_or_default(&env, &address);
+        if profile.is_blacklisted {
+            soroban_sdk::panic_with_error!(&env, ReputationError::Blacklisted);
+        }
+
+        let last = profile.last_activity;
+        let now = env.ledger().timestamp();
+        if now <= last || now.saturating_sub(last) < lookback_seconds {
+            soroban_sdk::panic_with_error!(&env, ReputationError::InvalidInput);
+        }
+
+        let metrics = Self::role_metrics_mut(&mut profile, &role);
+        let previous_score = metrics.score;
+        let new_score = Self::compute_recovery_towards_default(previous_score, recovery_bps);
+        metrics.score = new_score;
+        Self::refresh_badge(metrics, profile.is_blacklisted);
+        profile.last_activity = now;
+
+        storage::write_profile(&env, &address, &profile);
+        env.events().publish(
+            ("reputation", "ScoreAdjusted"),
+            ScoreAdjustedEvent {
+                address,
+                role,
+                delta: new_score.saturating_sub(previous_score),
+                new_score,
+                total_jobs: metrics.completed_jobs,
+                badge_level: metrics.badge_level,
+                adjusted_at: env.ledger().timestamp(),
             },
         );
         Self::bump_instance_ttl(&env);
@@ -637,6 +704,7 @@ impl ReputationContract {
         address.require_auth();
         let mut profile = storage::read_profile_or_default(&env, &address);
         profile.metadata_hash = Some(metadata_hash);
+        profile.last_activity = env.ledger().timestamp();
         storage::write_profile(&env, &address, &profile);
         Self::bump_instance_ttl(&env);
     }
@@ -1124,6 +1192,59 @@ mod test {
         // Now it should fail
         let res2 = client.try_update_score(&authorized_contract, &address, &Role::Freelancer, &100);
         assert!(res2.is_err());
+    }
+
+    #[test]
+    fn test_recover_after_inactivity() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let authorized_contract = Address::generate(&env);
+        let address = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        client.initialize(&admin);
+
+        // craft a stale profile with low score and old last_activity
+        use crate::profile::{Profile, RoleMetrics, ReviewAggregate};
+        let mut profile = Profile::new(address.clone());
+        profile.freelancer.score = 2_000;
+        profile.freelancer.completed_jobs = 1;
+        profile.last_activity = env.ledger().timestamp().saturating_sub(10_000);
+
+        // write directly into storage
+        storage::write_profile(&env, &address, &profile);
+
+        // authorize the contract that will call recover
+        client.set_authorized_contract(&admin, &authorized_contract);
+
+        // recover 50% of the gap towards default
+        client.recover_score(&authorized_contract, &address, &Role::Freelancer, &100u64, &5_000);
+
+        let score = client.get_score(&address, &Role::Freelancer);
+        // gap = 5000 - 2000 = 3000, 50% -> +1500 => 3500
+        assert_eq!(score.score, 3_500);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #2)")]
+    fn test_recover_requires_authorized_contract() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let attacker = Address::generate(&env);
+        let address = Address::generate(&env);
+        let contract_id = env.register_contract(None, ReputationContract);
+        let client = ReputationContractClient::new(&env, &contract_id);
+
+        client.initialize(&admin);
+
+        // attacker (unauthorized) attempts recovery
+        client.recover_score(&attacker, &address, &Role::Freelancer, &1u64, &1_000);
     }
 
     #[test]
