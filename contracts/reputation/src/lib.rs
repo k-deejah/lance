@@ -17,6 +17,7 @@ pub enum JobStatus {
     DeliverableSubmitted,
     Completed,
     Disputed,
+    Expired,
 }
 
 #[contracttype]
@@ -26,6 +27,7 @@ pub struct JobRecord {
     pub freelancer: Option<Address>,
     pub metadata_hash: Bytes,
     pub budget_stroops: i128,
+    pub expires_at: u64,
     pub status: JobStatus,
     pub bid_deadline: u64,
     pub collateral_token: Address,
@@ -631,6 +633,7 @@ mod test {
             freelancer: Some(freelancer.clone()),
             metadata_hash: Bytes::from_slice(&env, b"QmJob"),
             budget_stroops: 10,
+            expires_at: 0,
             status: JobStatus::Completed,
             bid_deadline: 0,
             collateral_token: Address::generate(&env),
@@ -644,6 +647,7 @@ mod test {
             freelancer: Some(target.clone()),
             metadata_hash: Bytes::from_slice(&env, b"QmJob2"),
             budget_stroops: 10,
+            expires_at: 0,
             status: JobStatus::Completed,
             bid_deadline: 0,
             collateral_token: Address::generate(&env),
