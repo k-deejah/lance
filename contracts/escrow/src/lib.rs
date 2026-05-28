@@ -101,6 +101,14 @@ pub enum DataKey {
     Locked,
     MultisigConfig(u64), // Per-job multisig configuration
     UpgradeAdmin,
+    Treasury,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreasuryConfig {
+    pub routing_address: Address,
+    pub fee_bps: u32,
 }
 
 #[contracttype]
@@ -150,6 +158,8 @@ pub enum EscrowError {
     UpgradeAdminNotSet = 18,
     ArithmeticOverflow = 19,
     DisputeResolutionExpired = 20,
+    FeeTooHigh = 21,
+    NothingToSweep = 22,
 }
 
 /// Maximum platform fee, in basis points (100% = 10_000 bps).
@@ -321,6 +331,41 @@ impl EscrowContract {
             log!(env, "checked_sub_i128 underflow: {} - {}", a, b);
             EscrowError::InvalidInput
         })
+    }
+
+    fn payout_with_fee(env: &Env, job_id: u64, job: &EscrowJob, amount: i128) -> Result<(), EscrowError> {
+        let token_client = token::Client::new(env, &job.token);
+        let mut freelancer_amount = amount;
+
+        if let Some(treasury_config) = env.storage().instance().get::<_, TreasuryConfig>(&DataKey::Treasury) {
+            let fee = amount
+                .checked_mul(treasury_config.fee_bps as i128)
+                .ok_or(EscrowError::ArithmeticError)?
+                .checked_div(10000)
+                .ok_or(EscrowError::ArithmeticError)?;
+
+            if fee > 0 {
+                freelancer_amount = amount
+                    .checked_sub(fee)
+                    .ok_or(EscrowError::ArithmeticError)?;
+
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &treasury_config.routing_address,
+                    &fee,
+                );
+            }
+        }
+
+        if freelancer_amount > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &job.freelancer,
+                &freelancer_amount,
+            );
+        }
+
+        Ok(())
     }
 
     fn sync_dispute_to_job_registry(env: &Env, job_id: u64) -> Result<(), EscrowError> {
@@ -758,7 +803,7 @@ impl EscrowContract {
         let _guard = enter_reentrancy_guard(&env);
         env.storage().persistent().set(&key, &job);
 
-        Self::payout_with_fee(&env, job_id, &job, milestone.amount);
+        Self::payout_with_fee(&env, job_id, &job, milestone.amount)?;
 
         log!(
             &env,
@@ -832,7 +877,7 @@ impl EscrowContract {
         let _guard = enter_reentrancy_guard(&env);
         env.storage().persistent().set(&key, &job);
 
-        Self::payout_with_fee(&env, job_id, &job, milestone.amount);
+        Self::payout_with_fee(&env, job_id, &job, milestone.amount)?;
 
         log!(
             &env,
@@ -1011,11 +1056,33 @@ impl EscrowContract {
         env.storage().persistent().set(&key, &job);
 
         let token_client = token::Client::new(&env, &job.token);
-        if payee_amount > 0 {
+        let mut freelancer_amount = payee_amount;
+
+        if let Some(treasury_config) = env.storage().instance().get::<_, TreasuryConfig>(&DataKey::Treasury) {
+            let fee = payee_amount
+                .checked_mul(treasury_config.fee_bps as i128)
+                .ok_or(EscrowError::ArithmeticError)?
+                .checked_div(10000)
+                .ok_or(EscrowError::ArithmeticError)?;
+
+            if fee > 0 {
+                freelancer_amount = payee_amount
+                    .checked_sub(fee)
+                    .ok_or(EscrowError::ArithmeticError)?;
+
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &treasury_config.routing_address,
+                    &fee,
+                );
+            }
+        }
+
+        if freelancer_amount > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
                 &job.freelancer,
-                &payee_amount,
+                &freelancer_amount,
             );
         }
         if payer_amount > 0 {
@@ -1446,19 +1513,22 @@ impl EscrowContract {
     /// Once set, milestone releases route `fee_bps` of each payout to the
     /// treasury and the remainder to the freelancer.
     pub fn set_fee_config(env: Env, treasury: Address, fee_bps: u32) -> Result<(), EscrowError> {
-        let admin: Address = env
+        let config: ContractConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
+            .get(&DataKey::Config)
             .ok_or(EscrowError::NotInitialized)?;
-        admin.require_auth();
+        config.admin.require_auth();
 
         if fee_bps > MAX_FEE_BPS {
             return Err(EscrowError::FeeTooHigh);
         }
 
-        env.storage().instance().set(&DataKey::Treasury, &treasury);
-        env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+        let t_config = TreasuryConfig {
+            routing_address: treasury.clone(),
+            fee_bps,
+        };
+        env.storage().instance().set(&DataKey::Treasury, &t_config);
         Self::bump_instance_ttl(&env);
 
         env.events().publish(
@@ -1475,12 +1545,22 @@ impl EscrowContract {
 
     /// Returns the active platform fee in basis points (0 when unset).
     pub fn get_fee_bps(env: Env) -> u32 {
-        Self::fee_bps(&env)
+        Self::bump_instance_ttl(&env);
+        if let Some(config) = env.storage().instance().get::<_, TreasuryConfig>(&DataKey::Treasury) {
+            config.fee_bps
+        } else {
+            0
+        }
     }
 
     /// Returns the configured treasury address, if any.
     pub fn get_treasury(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::Treasury)
+        Self::bump_instance_ttl(&env);
+        if let Some(config) = env.storage().instance().get::<_, TreasuryConfig>(&DataKey::Treasury) {
+            Some(config.routing_address)
+        } else {
+            None
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────
@@ -1556,12 +1636,12 @@ impl EscrowContract {
         job_id: u64,
         rescue_address: Address,
     ) -> Result<(), EscrowError> {
-        let admin: Address = env
+        let config: ContractConfig = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
+            .get(&DataKey::Config)
             .ok_or(EscrowError::NotInitialized)?;
-        admin.require_auth();
+        config.admin.require_auth();
 
         let key = DataKey::Job(job_id);
         let mut job: EscrowJob = env
