@@ -2,6 +2,7 @@ import { PrismaClient } from "@prisma/client";
 import { Pool, PoolClient } from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
 import dotenv from "dotenv";
+import { trace } from "./tracing";
 
 dotenv.config();
 
@@ -33,7 +34,13 @@ export const pool = new Pool({
 // ---------------------------------------------------------------------------
 // Pool event listeners — structured logging for diagnostics
 // ---------------------------------------------------------------------------
-pool.on("connect", () => {
+pool.on("connect", (client: PoolClient) => {
+  client
+    .query("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
+    .catch((err) => {
+      console.error("[POOL] Failed to configure transaction isolation:", err.message);
+    });
+
   if (process.env.NODE_ENV !== "production") {
     console.log(
       `[POOL] New client connected | total=${pool.totalCount} idle=${pool.idleCount} waiting=${pool.waitingCount}`
@@ -187,14 +194,58 @@ export async function connectWithRetry(): Promise<void> {
 // ---------------------------------------------------------------------------
 const adapter = new PrismaPg(pool);
 
-const globalForPrisma = global as unknown as { prisma: PrismaClient };
+const globalForPrisma = global as unknown as { prisma: ReturnType<typeof createPrismaClient> };
 
-export const prisma =
-  globalForPrisma.prisma ||
-  new PrismaClient({
+function createPrismaClient() {
+  const client = new PrismaClient({
     adapter,
     log: process.env.NODE_ENV === "development" ? ["query", "error", "warn"] : ["error"],
   });
+
+  return client.$extends({
+    query: {
+      $allModels: {
+        async $allOperations({ model, operation, args, query }) {
+          const startTime = Date.now();
+          const logger = trace.getLogger("db-query");
+
+          try {
+            const result = await query(args);
+            const duration = Date.now() - startTime;
+
+            if (duration > 1000) {
+              logger.warn(`Slow query detected: ${model}.${operation}`, {
+                duration,
+                model,
+                action: operation,
+                args: JSON.stringify(args).substring(0, 200),
+              });
+            }
+
+            logger.debug(`Query completed: ${model}.${operation}`, {
+              duration,
+              model,
+              action: operation,
+            });
+
+            return result;
+          } catch (error) {
+            const duration = Date.now() - startTime;
+            logger.error(`Query failed: ${model}.${operation}`, {
+              duration,
+              model,
+              action: operation,
+              error: error instanceof Error ? error.message : String(error),
+            });
+            throw error;
+          }
+        },
+      },
+    },
+  });
+}
+
+export const prisma = globalForPrisma.prisma || createPrismaClient();
 
 if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
 
