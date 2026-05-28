@@ -75,6 +75,12 @@
                 },
                 {
                   "bytes": "516d50726f706f73616c48617368"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 50
+                  }
                 }
               ]
             }
@@ -354,6 +360,25 @@
                       "map": [
                         {
                           "key": {
+                            "symbol": "collateral_released"
+                          },
+                          "val": {
+                            "bool": false
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "collateral_stroops"
+                          },
+                          "val": {
+                            "i128": {
+                              "hi": 0,
+                              "lo": 50
+                            }
+                          }
+                        },
+                        {
+                          "key": {
                             "symbol": "freelancer"
                           },
                           "val": {
@@ -461,6 +486,14 @@
                 "durability": "persistent",
                 "val": {
                   "map": [
+                    {
+                      "key": {
+                        "symbol": "bidding_deadline"
+                      },
+                      "val": {
+                        "u64": 100
+                      }
+                    },
                     {
                       "key": {
                         "symbol": "budget_stroops"
@@ -880,6 +913,14 @@
               "map": [
                 {
                   "key": {
+                    "symbol": "bidding_deadline"
+                  },
+                  "val": {
+                    "u64": 100
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "budget_stroops"
                   },
                   "val": {
@@ -966,6 +1007,12 @@
                 },
                 {
                   "bytes": "516d50726f706f73616c48617368"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 50
+                  }
                 }
               ]
             }
@@ -1093,6 +1140,25 @@
               "vec": [
                 {
                   "map": [
+                    {
+                      "key": {
+                        "symbol": "collateral_released"
+                      },
+                      "val": {
+                        "bool": false
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "collateral_stroops"
+                      },
+                      "val": {
+                        "i128": {
+                          "hi": 0,
+                          "lo": 50
+                        }
+                      }
+                    },
                     {
                       "key": {
                         "symbol": "freelancer"
@@ -1274,6 +1340,14 @@
             ],
             "data": {
               "map": [
+                {
+                  "key": {
+                    "symbol": "bidding_deadline"
+                  },
+                  "val": {
+                    "u64": 100
+                  }
+                },
                 {
                   "key": {
                     "symbol": "budget_stroops"
@@ -1489,6 +1563,14 @@
             ],
             "data": {
               "map": [
+                {
+                  "key": {
+                    "symbol": "bidding_deadline"
+                  },
+                  "val": {
+                    "u64": 100
+                  }
+                },
                 {
                   "key": {
                     "symbol": "budget_stroops"

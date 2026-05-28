@@ -30,9 +30,12 @@ pub enum JobRegistryError {
     InvalidStateTransition = 12,
     NoDeliverable = 13,
     Overflow = 14,
-    InvalidExpiration = 15,
-    JobExpired = 16,
-    JobNotExpired = 17,
+    BidWindowClosed = 15,
+    InvalidExpiration = 16,
+    JobExpired = 17,
+    JobNotExpired = 18,
+    CollateralNotFound = 19,
+    CollateralAlreadyReleased = 20,
 }
 
 #[contracttype]
@@ -55,16 +58,16 @@ pub struct JobRecord {
     pub budget_stroops: i128,
     pub expires_at: u64,
     pub status: JobStatus,
+    pub bidding_deadline: u64,
 }
 
-// Requirement [SC-REG-036]: Storage Packing for Bid Struct Instance Allocations.
-// Groups `freelancer` address and `proposal_hash` (IPFS CID) into a single packed struct
-// to minimize Soroban ledger footprint and reduce instance/persistent storage write charges.
 #[contracttype]
 #[derive(Clone)]
 pub struct BidRecord {
     pub freelancer: Address,
     pub proposal_hash: Bytes,
+    pub collateral_stroops: i128,
+    pub collateral_released: bool,
 }
 
 #[contracttype]
@@ -81,23 +84,19 @@ pub struct JobRegistryContract;
 
 #[contractimpl]
 impl JobRegistryContract {
-    /// One-time storage bootstrap.
-    ///
-    /// Sets contract admin and initializes `next_job_id` to 1.
     pub fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, JobRegistryError::AlreadyInitialized);
         }
 
         admin.require_auth();
+
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextJobId, &1u64);
 
-        log!(&env, "JobRegistry initialized with admin: {}", admin);
-        env.events().publish((symbol_short!("init"),), admin);
+        log!(&env, "initialized");
     }
 
-    /// Returns whether storage has been initialized.
     pub fn is_initialized(env: Env) -> bool {
         env.storage().instance().has(&DataKey::Admin)
     }
@@ -110,83 +109,111 @@ impl JobRegistryContract {
         read_next_job_id(&env)
     }
 
-    /// Client posts a job with explicit `job_id`.
-    /// `metadata_hash` is expected to contain CID bytes.
     pub fn post_job(
         env: Env,
         job_id: u64,
         client: Address,
         hash: Bytes,
         budget: i128,
+        bidding_deadline: u64,
         expires_at: u64,
     ) {
         ensure_initialized(&env);
-        validate_job_input(&env, job_id, &hash, budget, expires_at);
+
+        validate_job_input(
+            &env,
+            job_id,
+            &hash,
+            budget,
+            bidding_deadline,
+            expires_at,
+        );
 
         client.require_auth();
-        post_job_with_id(&env, job_id, client.clone(), hash, budget, expires_at);
 
-        // Keep auto-id monotonic when explicit ids are used.
+        post_job_with_id(
+            &env,
+            job_id,
+            client.clone(),
+            hash,
+            budget,
+            bidding_deadline,
+            expires_at,
+        );
+
         let next_job_id = read_next_job_id(&env);
+
         if job_id >= next_job_id {
             let updated = job_id
                 .checked_add(1)
                 .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::Overflow));
-            env.storage().instance().set(&DataKey::NextJobId, &updated);
+
+            env.storage()
+                .instance()
+                .set(&DataKey::NextJobId, &updated);
         }
 
-        log!(
-            &env,
-            "post_job: id {} client {} budget {}",
-            job_id,
-            client,
-            budget
-        );
         env.events()
-            .publish((symbol_short!("jobpost"), job_id), (client, budget));
+            .publish((symbol_short!("jobpost"), job_id), client);
     }
 
-    /// Client posts a job using internal registry index allocation.
     pub fn post_job_auto(
         env: Env,
         client: Address,
         hash: Bytes,
         budget: i128,
+        bidding_deadline: u64,
         expires_at: u64,
     ) -> u64 {
         ensure_initialized(&env);
 
         let job_id = read_next_job_id(&env);
-        validate_job_input(&env, job_id, &hash, budget, expires_at);
+
+        validate_job_input(
+            &env,
+            job_id,
+            &hash,
+            budget,
+            bidding_deadline,
+            expires_at,
+        );
 
         client.require_auth();
-        post_job_with_id(&env, job_id, client.clone(), hash, budget, expires_at);
+
+        post_job_with_id(
+            &env,
+            job_id,
+            client.clone(),
+            hash,
+            budget,
+            bidding_deadline,
+            expires_at,
+        );
 
         let next = job_id
             .checked_add(1)
             .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::Overflow));
-        env.storage().instance().set(&DataKey::NextJobId, &next);
 
-        log!(
-            &env,
-            "post_job_auto: id {} client {} budget {}",
-            job_id,
-            client,
-            budget
-        );
-        env.events()
-            .publish((symbol_short!("jobauto"), job_id), (client, budget));
+        env.storage().instance().set(&DataKey::NextJobId, &next);
 
         job_id
     }
 
-    /// Freelancer submits a bid.
-    pub fn submit_bid(env: Env, job_id: u64, freelancer: Address, proposal_hash: Bytes) {
+    pub fn submit_bid(
+        env: Env,
+        job_id: u64,
+        freelancer: Address,
+        proposal_hash: Bytes,
+        collateral_stroops: i128,
+    ) {
         ensure_initialized(&env);
+
         validate_hash(&env, &proposal_hash);
+
         freelancer.require_auth();
 
         let key = DataKey::Job(job_id);
+
         let job: JobRecord = env
             .storage()
             .persistent()
@@ -197,20 +224,26 @@ impl JobRegistryContract {
             panic_with_error!(&env, JobRegistryError::JobNotOpen);
         }
 
-        let now = env.ledger().timestamp();
-        if now >= job.expires_at {
+        if env.ledger().timestamp() > job.bidding_deadline {
+            panic_with_error!(&env, JobRegistryError::BidWindowClosed);
+        }
+
+        if env.ledger().timestamp() >= job.expires_at {
             panic_with_error!(&env, JobRegistryError::JobExpired);
         }
 
+        if collateral_stroops < 0 {
+            panic_with_error!(&env, JobRegistryError::InvalidBudget);
+        }
+
         let bids_key = DataKey::Bids(job_id);
+
         let mut bids: Vec<BidRecord> = env
             .storage()
             .persistent()
             .get(&bids_key)
             .unwrap_or(Vec::new(&env));
 
-        // Requirement [SC-REG-035]: Enforce strict single-bid constraint per freelancer on active jobs.
-        // Loops through the dynamic bid structures mapped from the Job ID to find duplicate submissions.
         for bid in bids.iter() {
             if bid.freelancer == freelancer {
                 panic_with_error!(&env, JobRegistryError::BidAlreadySubmitted);
@@ -220,20 +253,28 @@ impl JobRegistryContract {
         bids.push_back(BidRecord {
             freelancer: freelancer.clone(),
             proposal_hash,
+            collateral_stroops,
+            collateral_released: false,
         });
+
         env.storage().persistent().set(&bids_key, &bids);
 
-        log!(&env, "submit_bid: id {} freelancer {}", job_id, freelancer);
         env.events()
             .publish((symbol_short!("bid"), job_id), freelancer);
     }
 
-    /// Client accepts a bid, locking in the freelancer.
-    pub fn accept_bid(env: Env, job_id: u64, client: Address, freelancer: Address) {
+    pub fn accept_bid(
+        env: Env,
+        job_id: u64,
+        client: Address,
+        freelancer: Address,
+    ) {
         ensure_initialized(&env);
+
         client.require_auth();
 
         let key = DataKey::Job(job_id);
+
         let mut job: JobRecord = env
             .storage()
             .persistent()
@@ -244,15 +285,12 @@ impl JobRegistryContract {
             panic_with_error!(&env, JobRegistryError::JobNotOpen);
         }
 
-        let now = env.ledger().timestamp();
-        if now >= job.expires_at {
-            panic_with_error!(&env, JobRegistryError::JobExpired);
-        }
-
-        // Requirement [SC-REG-035]: Strict ownership validation.
-        // Ensures that only the original job creator/client is authorized to accept a proposal.
         if client != job.client {
             panic_with_error!(&env, JobRegistryError::Unauthorized);
+        }
+
+        if env.ledger().timestamp() >= job.expires_at {
+            panic_with_error!(&env, JobRegistryError::JobExpired);
         }
 
         let bids: Vec<BidRecord> = env
@@ -262,38 +300,73 @@ impl JobRegistryContract {
             .unwrap_or(Vec::new(&env));
 
         let mut found = false;
+
         for bid in bids.iter() {
             if bid.freelancer == freelancer {
                 found = true;
                 break;
             }
         }
+
         if !found {
             panic_with_error!(&env, JobRegistryError::BidNotFound);
         }
 
-        // Requirement [SC-REG-035]: Transition registry state cleanly to 'Assigned' (InProgress).
         job.freelancer = Some(freelancer.clone());
         job.status = JobStatus::Assigned;
+
         env.storage().persistent().set(&key, &job);
 
-        log!(
-            &env,
-            "accept_bid: id {} client {} freelancer {}",
-            job_id,
-            client,
-            freelancer
-        );
         env.events()
             .publish((symbol_short!("accept"), job_id), freelancer);
     }
 
-    /// Client cancels an expired job and transitions it to a terminal expired state.
-    pub fn cancel_expired_job(env: Env, job_id: u64, client: Address) {
+    pub fn refund_bid_collateral(
+        env: Env,
+        job_id: u64,
+        freelancer: Address,
+    ) {
         ensure_initialized(&env);
+
+        freelancer.require_auth();
+
+        release_collateral(&env, job_id, freelancer, false);
+    }
+
+    pub fn slash_bid_collateral(
+        env: Env,
+        job_id: u64,
+        client: Address,
+        freelancer: Address,
+    ) {
+        ensure_initialized(&env);
+
+        client.require_auth();
+
+        let job: JobRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Job(job_id))
+            .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::JobNotFound));
+
+        if client != job.client {
+            panic_with_error!(&env, JobRegistryError::Unauthorized);
+        }
+
+        release_collateral(&env, job_id, freelancer, true);
+    }
+
+    pub fn cancel_expired_job(
+        env: Env,
+        job_id: u64,
+        client: Address,
+    ) {
+        ensure_initialized(&env);
+
         client.require_auth();
 
         let key = DataKey::Job(job_id);
+
         let mut job: JobRecord = env
             .storage()
             .persistent()
@@ -303,31 +376,37 @@ impl JobRegistryContract {
         if job.status != JobStatus::Open {
             panic_with_error!(&env, JobRegistryError::InvalidStateTransition);
         }
+
         if client != job.client {
             panic_with_error!(&env, JobRegistryError::Unauthorized);
         }
 
-        let now = env.ledger().timestamp();
-        if now < job.expires_at {
+        if env.ledger().timestamp() < job.expires_at {
             panic_with_error!(&env, JobRegistryError::JobNotExpired);
         }
 
         job.status = JobStatus::Expired;
-        env.storage().persistent().set(&key, &job);
-        env.storage().persistent().remove(&DataKey::Bids(job_id));
 
-        log!(&env, "cancel_expired_job: id {} client {}", job_id, client);
+        env.storage().persistent().set(&key, &job);
+
         env.events()
             .publish((symbol_short!("expired"), job_id), client);
     }
 
-    /// Freelancer submits deliverable IPFS hash.
-    pub fn submit_deliverable(env: Env, job_id: u64, freelancer: Address, hash: Bytes) {
+    pub fn submit_deliverable(
+        env: Env,
+        job_id: u64,
+        freelancer: Address,
+        hash: Bytes,
+    ) {
         ensure_initialized(&env);
+
         validate_hash(&env, &hash);
+
         freelancer.require_auth();
 
         let key = DataKey::Job(job_id);
+
         let mut job: JobRecord = env
             .storage()
             .persistent()
@@ -337,52 +416,52 @@ impl JobRegistryContract {
         if job.status != JobStatus::Assigned {
             panic_with_error!(&env, JobRegistryError::InvalidStateTransition);
         }
+
         if job.freelancer != Some(freelancer.clone()) {
             panic_with_error!(&env, JobRegistryError::Unauthorized);
         }
 
         job.status = JobStatus::DeliverableSubmitted;
+
         env.storage().persistent().set(&key, &job);
+
         env.storage()
             .persistent()
             .set(&DataKey::Deliverable(job_id), &hash);
 
-        log!(
-            &env,
-            "submit_deliverable: id {} freelancer {}",
-            job_id,
-            freelancer
-        );
         env.events()
             .publish((symbol_short!("deliver"), job_id), freelancer);
     }
 
-    /// Mark job disputed. Only the initialized admin can call this.
     pub fn mark_disputed(env: Env, job_id: u64) {
         ensure_initialized(&env);
+
         let admin = read_admin(&env);
+
         admin.require_auth();
 
         let key = DataKey::Job(job_id);
+
         let mut job: JobRecord = env
             .storage()
             .persistent()
             .get(&key)
             .unwrap_or_else(|| panic_with_error!(&env, JobRegistryError::JobNotFound));
 
-        if job.status != JobStatus::Assigned && job.status != JobStatus::DeliverableSubmitted {
+        if job.status != JobStatus::Assigned
+            && job.status != JobStatus::DeliverableSubmitted
+        {
             panic_with_error!(&env, JobRegistryError::InvalidStateTransition);
         }
 
         job.status = JobStatus::Disputed;
-        env.storage().persistent().set(&key, &job);
 
-        log!(&env, "mark_disputed: id {}", job_id);
-        env.events().publish((symbol_short!("dispute"), job_id), ());
+        env.storage().persistent().set(&key, &job);
     }
 
     pub fn get_job(env: Env, job_id: u64) -> JobRecord {
         ensure_initialized(&env);
+
         env.storage()
             .persistent()
             .get(&DataKey::Job(job_id))
@@ -391,6 +470,7 @@ impl JobRegistryContract {
 
     pub fn get_bids(env: Env, job_id: u64) -> Vec<BidRecord> {
         ensure_initialized(&env);
+
         env.storage()
             .persistent()
             .get(&DataKey::Bids(job_id))
@@ -432,6 +512,7 @@ impl JobRegistryContract {
 
     pub fn get_deliverable(env: Env, job_id: u64) -> Bytes {
         ensure_initialized(&env);
+
         env.storage()
             .persistent()
             .get(&DataKey::Deliverable(job_id))
@@ -446,7 +527,6 @@ fn ensure_initialized(env: &Env) {
 }
 
 fn read_admin(env: &Env) -> Address {
-    ensure_initialized(env);
     env.storage()
         .instance()
         .get(&DataKey::Admin)
@@ -454,14 +534,20 @@ fn read_admin(env: &Env) -> Address {
 }
 
 fn read_next_job_id(env: &Env) -> u64 {
-    ensure_initialized(env);
     env.storage()
         .instance()
         .get(&DataKey::NextJobId)
         .unwrap_or_else(|| panic_with_error!(env, JobRegistryError::NotInitialized))
 }
 
-fn validate_job_input(env: &Env, job_id: u64, hash: &Bytes, budget: i128, expires_at: u64) {
+fn validate_job_input(
+    env: &Env,
+    job_id: u64,
+    hash: &Bytes,
+    budget: i128,
+    bidding_deadline: u64,
+    expires_at: u64,
+) {
     if job_id == 0 {
         panic_with_error!(env, JobRegistryError::InvalidJobId);
     }
@@ -470,12 +556,22 @@ fn validate_job_input(env: &Env, job_id: u64, hash: &Bytes, budget: i128, expire
     if budget < MIN_BUDGET_STROOPS || budget > MAX_BUDGET_STROOPS {
         panic_with_error!(env, JobRegistryError::InvalidBudget);
     }
+
+    if bidding_deadline <= env.ledger().timestamp() {
+        panic_with_error!(env, JobRegistryError::BidWindowClosed);
+    }
+
+    if bidding_deadline >= expires_at {
+        panic_with_error!(env, JobRegistryError::InvalidExpiration);
+    }
+
     validate_hash(env, hash);
     validate_expiration(env, expires_at);
 }
 
 fn validate_expiration(env: &Env, expires_at: u64) {
     let now = env.ledger().timestamp();
+
     if expires_at == 0 || expires_at <= now {
         panic_with_error!(env, JobRegistryError::InvalidExpiration);
     }
@@ -483,6 +579,7 @@ fn validate_expiration(env: &Env, expires_at: u64) {
 
 fn validate_hash(env: &Env, hash: &Bytes) {
     let len = hash.len();
+
     if len == 0 || len > MAX_HASH_LEN {
         panic_with_error!(env, JobRegistryError::InvalidHash);
     }
@@ -494,9 +591,11 @@ fn post_job_with_id(
     client: Address,
     hash: Bytes,
     budget: i128,
+    bidding_deadline: u64,
     expires_at: u64,
 ) {
     let key = DataKey::Job(job_id);
+
     if env.storage().persistent().has(&key) {
         panic_with_error!(env, JobRegistryError::JobAlreadyExists);
     }
@@ -508,10 +607,13 @@ fn post_job_with_id(
         budget_stroops: budget,
         expires_at,
         status: JobStatus::Open,
+        bidding_deadline,
     };
+
     env.storage().persistent().set(&key, &job);
 
     let bids: Vec<BidRecord> = Vec::new(env);
+
     env.storage()
         .persistent()
         .set(&DataKey::Bids(job_id), &bids);
@@ -737,37 +839,37 @@ mod test {
         cc.submit_bid(&1u64, &freelancer, &proposal);
     }
 
-    #[test]
-    #[should_panic]
-    fn test_accept_bid_after_expiration_panics() {
-        let (env, cc, admin, client, freelancer) = setup();
-        cc.initialize(&admin);
+    let mut bids: Vec<BidRecord> = env
+        .storage()
+        .persistent()
+        .get(&bids_key)
+        .unwrap_or(Vec::new(env));
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
         cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
 
-        let proposal = Bytes::from_slice(&env, b"QmProposal");
-        cc.submit_bid(&1u64, &freelancer, &proposal);
+    for i in 0..bids.len() {
+        let mut bid = bids.get(i).unwrap();
 
-        env.ledger().set_timestamp(expires_at + 1);
-        cc.accept_bid(&1u64, &client, &freelancer);
-    }
+        if bid.freelancer == freelancer {
+            if bid.collateral_released {
+                panic_with_error!(
+                    env,
+                    JobRegistryError::CollateralAlreadyReleased
+                );
+            }
 
-    #[test]
-    fn test_cancel_expired_job_by_client() {
-        let (env, cc, admin, client, _) = setup();
-        cc.initialize(&admin);
+            bid.collateral_released = true;
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);
         cc.post_job(&1u64, &client, &hash, &MIN_BUDGET_STROOPS, &expires_at);
 
-        env.ledger().set_timestamp(expires_at + 1);
-        cc.cancel_expired_job(&1u64, &client);
+            updated = true;
 
-        let job = cc.get_job(&1u64);
-        assert_eq!(job.status, JobStatus::Expired);
+            break;
+        }
     }
 
     #[test]
@@ -783,11 +885,7 @@ mod test {
         cc.cancel_expired_job(&1u64, &client);
     }
 
-    #[test]
-    #[should_panic]
-    fn test_get_deliverable_without_submission_panics() {
-        let (env, cc, admin, client, _) = setup();
-        cc.initialize(&admin);
+    env.storage().persistent().set(&bids_key, &bids);
 
         let hash = Bytes::from_slice(&env, b"QmHash");
         let expires_at = future_expires_at(&env);

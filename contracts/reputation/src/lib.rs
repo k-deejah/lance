@@ -44,6 +44,7 @@ pub enum Role {
 pub struct ReputationScore {
     pub address: Address,
     pub role: Role,
+    /// Score in basis points (0\u201310000 = 0\u2013100%)
     pub score: i32,
     pub total_jobs: u32,
     pub total_points: i128,
@@ -219,6 +220,7 @@ impl ReputationContract {
         }
     }
 
+    fn score_from_profile(address: &Address, role: Role, profile: &profile::Profile) -> ReputationScore {
     fn score_from_profile(
         address: &Address,
         role: Role,
@@ -470,6 +472,19 @@ impl ReputationContract {
         Self::require_authorized_contract(&env, &caller_contract);
 
         let mut profile = storage::read_profile_or_default(&env, &address);
+        let (new_score, total_jobs) = match role {
+            Role::Client => {
+                profile.client_score = Self::clamp_score(profile.client_score.saturating_add(delta));
+                profile.client_jobs = profile.client_jobs.saturating_add(1);
+                (profile.client_score, profile.client_jobs)
+            }
+            Role::Freelancer => {
+                profile.freelancer_score =
+                    Self::clamp_score(profile.freelancer_score.saturating_add(delta));
+                profile.freelancer_jobs = profile.freelancer_jobs.saturating_add(1);
+                (profile.freelancer_score, profile.freelancer_jobs)
+            }
+        };
         if profile.is_blacklisted {
             soroban_sdk::panic_with_error!(&env, ReputationError::Blacklisted);
         }
@@ -642,6 +657,9 @@ mod test {
     #[contractimpl]
     impl MockJobRegistry {
         pub fn set_job(env: Env, job_id: u64, job: JobRecord) {
+            env.storage()
+                .persistent()
+                .set(&MockKey::Job(job_id), &job);
             env.storage().persistent().set(&MockKey::Job(job_id), &job);
         }
 
@@ -1053,6 +1071,7 @@ mod test {
     }
 
     #[test]
+    #[should_panic(expected = "Error(Contract, #2)")] 
     #[should_panic(expected = "Error(Contract, #2)")]
     fn test_upgrade_requires_admin() {
         let env = Env::default();
