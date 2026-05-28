@@ -112,6 +112,7 @@ app.get("/health", async (req: Request, res: Response) => {
 // Graceful shutdown handler
 process.on("SIGTERM", async () => {
   logger.info("SIGTERM received, shutting down gracefully");
+  stopStorageCleanup();
   try {
     await prisma.$disconnect();
     logger.info("Database connection closed");
@@ -132,6 +133,7 @@ async function bootstrap(): Promise<void> {
   try {
     await connectWithRetry();
     startPoolHealthCheck();
+    startStorageCleanup();
     app.listen(port, () => {
       console.log(`⚡️[server]: Server is running at http://localhost:${port}`);
       // Update pool metrics periodically so the Prometheus scrape has fresh data
