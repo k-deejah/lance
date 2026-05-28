@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, log, panic_with_error, symbol_short,
