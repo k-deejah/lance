@@ -50,8 +50,9 @@ const csrfMiddleware = (req: Request, res: Response, next: NextFunction) => {
 
   const csrfCookie = req.cookies[CSRF_COOKIE_NAME];
   const csrfHeader = req.headers["x-csrf-token"];
+  const csrfHeaderStr = Array.isArray(csrfHeader) ? csrfHeader[0] : csrfHeader;
 
-  if (!csrfCookie || !csrfHeader || !crypto.timingSafeEqual(Buffer.from(csrfCookie), Buffer.from(csrfHeader))) {
+  if (!csrfCookie || !csrfHeaderStr || !crypto.timingSafeEqual(Buffer.from(csrfCookie), Buffer.from(csrfHeaderStr))) {
     return res.status(403).json({ error: "Invalid CSRF token" });
   }
 
