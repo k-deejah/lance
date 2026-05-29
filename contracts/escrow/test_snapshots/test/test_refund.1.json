@@ -605,6 +605,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "funded_ledger_seq"
+                      },
+                      "val": {
+                        "u32": 0
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "milestones"
                       },
                       "val": {
@@ -673,7 +681,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 5000
+                          "lo": 0
                         }
                       }
                     },
@@ -2360,6 +2368,14 @@
                 },
                 {
                   "key": {
+                    "symbol": "funded_ledger_seq"
+                  },
+                  "val": {
+                    "u32": 0
+                  }
+                },
+                {
+                  "key": {
                     "symbol": "milestones"
                   },
                   "val": {
@@ -2428,7 +2444,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 5000
+                      "lo": 0
                     }
                   }
                 },
