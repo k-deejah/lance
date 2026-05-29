@@ -214,6 +214,11 @@ model jobs {
   @@index([client_address], map: "idx_jobs_client_address")
   @@index([freelancer_address], map: "idx_jobs_freelancer_address")
   @@index([status], map: "idx_jobs_status")
+  @@index([created_at(sort: Desc), id(sort: Desc)], map: "idx_jobs_created_id_desc")
+  @@index([status, created_at(sort: Desc), id(sort: Desc)], map: "idx_jobs_status_created_id_desc")
+  @@index([budget_usdc(sort: Desc), created_at(sort: Desc), id(sort: Desc)], map: "idx_jobs_budget_created_id_desc")
+  @@index([deadline_at, created_at(sort: Desc), id(sort: Desc)], map: "idx_jobs_deadline_created_id_desc")
+  @@index([skills], map: "idx_jobs_skills_gin", type: Gin)
 }
 
 model milestone_events {
