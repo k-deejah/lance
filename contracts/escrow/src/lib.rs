@@ -49,7 +49,7 @@ impl EscrowStatus {
             (EscrowStatus::WorkInProgress, EscrowStatus::Refunded) => Ok(()),
             (EscrowStatus::Disputed, EscrowStatus::Resolved) => Ok(()),
             (EscrowStatus::Disputed, EscrowStatus::Refunded) => Ok(()),
-            _ => Err(EscrowError::InvalidStateTransition),
+            _ => Err(EscrowError::InvalidState),
         }
     }
 }
@@ -106,8 +106,6 @@ pub enum DataKey {
     FeeBps,
     MultisigConfig(u64), // Per-job multisig configuration
     UpgradeAdmin,
-    Treasury,
-    FeeBps,
 }
 
 #[contracttype]
@@ -183,6 +181,7 @@ pub enum EscrowError {
     JobRegistrySyncFailed = 9,
     UpgradeUnauthorized = 10,
     ReentrantCall = 11,
+    FeeTooHigh = 12,
 }
 
 /// Maximum platform fee, in basis points (100% = 10_000 bps).
@@ -290,41 +289,6 @@ pub struct DisputeExpiredEvent {
     pub expired_at: u64,
 }
 
-#[contracttype]
-#[derive(Clone)]
-pub struct FeeConfigUpdatedEvent {
-    pub treasury: Address,
-    pub fee_bps: u32,
-    pub updated_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct LockupUpdatedEvent {
-    pub job_id: u64,
-    pub expires_at: u64,
-    pub updated_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct EmergencySweepEvent {
-    pub job_id: u64,
-    pub admin: Address,
-    pub rescue_address: Address,
-    pub amount: i128,
-    pub swept_at: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct MilestonesAmendedEvent {
-    pub job_id: u64,
-    pub milestone_count: u32,
-    pub remaining_amount: i128,
-    pub amended_at: u64,
-}
-
 struct ReentrancyGuard<'a> {
     env: &'a Env,
 }
@@ -337,7 +301,7 @@ impl Drop for ReentrancyGuard<'_> {
 
 fn enter_reentrancy_guard(env: &Env) -> ReentrancyGuard<'_> {
     if env.storage().instance().has(&DataKey::Locked) {
-        panic_with_error!(env, EscrowError::ReentrancyDetected);
+        panic_with_error!(env, EscrowError::ReentrantCall);
     }
     env.storage().instance().set(&DataKey::Locked, &());
     ReentrancyGuard { env }
@@ -645,19 +609,15 @@ fn checked_sub_i128(
             return Err(EscrowError::InvalidInput);
         }
         let now: u64 = env.ledger().timestamp();
-let expires_duration = 30u64
-    .checked_mul(24)
-    .and_then(|h| h.checked_mul(60))
-    .and_then(|m| m.checked_mul(60))
-let expires_duration = 30u64
-    .checked_mul(24)
-    .and_then(|h| h.checked_mul(60))
-    .and_then(|m| m.checked_mul(60))
-    .ok_or(EscrowError::ArithmeticError)?;
+        let expires_duration = 30u64
+            .checked_mul(24)
+            .and_then(|h| h.checked_mul(60))
+            .and_then(|m| m.checked_mul(60))
+            .ok_or(EscrowError::InvalidInput)?;
 
-let expires_at = now
-    .checked_add(expires_duration)
-    .ok_or(EscrowError::ArithmeticError)?;
+        let expires_at = now
+            .checked_add(expires_duration)
+            .ok_or(EscrowError::InvalidInput)?;
 
         let job = EscrowJob {
             client: client.clone(),
@@ -843,7 +803,7 @@ let expires_at = now
         let _guard = enter_reentrancy_guard(&env);
         env.storage().persistent().set(&key, &job);
 
-        Self::payout_with_fee(&env, &job, milestone.amount);
+        Self::payout_with_fee(&env, job_id, &job, milestone.amount)?;
 
         log!(
             &env,
@@ -929,7 +889,7 @@ if milestone_index >= job.milestones.len() {
         let _guard = enter_reentrancy_guard(&env);
         env.storage().persistent().set(&key, &job);
 
-        Self::payout_with_fee(&env, &job, milestone.amount);
+        Self::payout_with_fee(&env, job_id, &job, milestone.amount)?;
 
         log!(
             &env,
@@ -940,6 +900,8 @@ if milestone_index >= job.milestones.len() {
         env.storage().persistent().set(&key, &job);
         Self::bump_job_ttl(&env, &key);
         Self::exit_job_lock(&env, lock_key);
+
+        Ok(())
     }
 
     /// Either party opens a dispute, locking remaining funds.
@@ -1021,11 +983,11 @@ if !(job.status == EscrowStatus::Funded
             .checked_mul(24)
             .and_then(|h| h.checked_mul(60))
             .and_then(|m| m.checked_mul(60))
-            .ok_or(EscrowError::ArithmeticError)?;
+            .ok_or(EscrowError::InvalidInput)?;
         let expiration_threshold = job
             .expires_at
             .checked_add(grace_period)
-            .ok_or(EscrowError::ArithmeticError)?;
+            .ok_or(EscrowError::InvalidInput)?;
         if now > expiration_threshold {
             return Err(EscrowError::InvalidState);
         }
@@ -1256,7 +1218,7 @@ if !(job.status == EscrowStatus::Funded
         let job = Self::get_job(env, job_id)?;
         job.total_amount
             .checked_sub(job.released_amount)
-            .ok_or(EscrowError::ArithmeticError)
+            .ok_or(EscrowError::InvalidInput)
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -1638,28 +1600,71 @@ exit_reentrancy_guard(&env);
             .unwrap_or(0u32)
     }
 
-    fn payout_with_fee(env: &Env, job: &EscrowJob, amount: i128) {
+    fn compute_fee_amount(amount: i128, fee_bps: u32) -> Result<i128, EscrowError> {
+        if fee_bps == 0 {
+            return Ok(0);
+        }
+        if fee_bps > MAX_FEE_BPS {
+            return Err(EscrowError::FeeTooHigh);
+        }
+
+        let unit = amount
+            .checked_div(10_000)
+            .ok_or(EscrowError::InvalidInput)?;
+        let remainder = amount
+            .checked_rem(10_000)
+            .ok_or(EscrowError::InvalidInput)?;
+
+        let base_fee = unit
+            .checked_mul(fee_bps as i128)
+            .ok_or(EscrowError::InvalidInput)?;
+        let remainder_fee = remainder
+            .checked_mul(fee_bps as i128)
+            .ok_or(EscrowError::InvalidInput)?
+            .checked_div(10_000)
+            .ok_or(EscrowError::InvalidInput)?;
+
+        let fee_amount = base_fee
+            .checked_add(remainder_fee)
+            .ok_or(EscrowError::InvalidInput)?;
+
+        Ok(if fee_amount > amount { amount } else { fee_amount })
+    }
+
+    fn payout_with_fee(
+        env: &Env,
+        _job_id: u64,
+        job: &EscrowJob,
+        amount: i128,
+    ) -> Result<(), EscrowError> {
         let treasury = env.storage().instance().get::<_, Address>(&DataKey::Treasury);
         let fee_bps = Self::fee_bps(env);
-        let fee_amount = if fee_bps > 0 {
-            amount
-                .checked_mul(fee_bps as i128)
-                .and_then(|value| value.checked_div(10_000))
-                .unwrap_or(0)
+        let fee_amount = if fee_bps > 0 && fee_bps <= MAX_FEE_BPS {
+            Self::compute_fee_amount(amount, fee_bps)?
         } else {
             0
         };
-        let payout_amount = amount.checked_sub(fee_amount).unwrap_or(0);
+        let payout_amount = amount.checked_sub(fee_amount).ok_or(EscrowError::InvalidInput)?;
         let token_client = token::Client::new(env, &job.token);
 
         if fee_amount > 0 {
             if let Some(treasury_addr) = treasury {
-                token_client.transfer(&env.current_contract_address(), &treasury_addr, &fee_amount);
+                token_client.transfer(
+                    &env.current_contract_address(),
+                    &treasury_addr,
+                    &fee_amount,
+                );
             }
         }
         if payout_amount > 0 {
-            token_client.transfer(&env.current_contract_address(), &job.freelancer, &payout_amount);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &job.freelancer,
+                &payout_amount,
+            );
         }
+
+        Ok(())
     }
 
     fn exit_reentrancy_guard(env: &Env) {
@@ -1872,56 +1877,6 @@ exit_reentrancy_guard(&env);
         );
 
         Ok(())
-    }
-
-    fn fee_bps(env: &Env) -> u32 {
-        env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0)
-    }
-
-    fn payout_with_fee(
-        env: &Env,
-        _job_id: u64,
-        job: &EscrowJob,
-        amount: i128,
-    ) {
-        let treasury_opt: Option<Address> = env.storage().instance().get(&DataKey::Treasury);
-        let fee_bps = Self::fee_bps(env);
-        let token_client = token::Client::new(env, &job.token);
-
-        if let Some(treasury) = treasury_opt {
-            if fee_bps > 0 && fee_bps <= 10_000 {
-                // fee_amount = amount * fee_bps / 10_000
-                let fee_amount = amount
-                    .checked_mul(fee_bps as i128)
-                    .unwrap()
-                    .checked_div(10_000)
-                    .unwrap();
-                let freelancer_amount = amount.checked_sub(fee_amount).unwrap();
-
-                if fee_amount > 0 {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &treasury,
-                        &fee_amount,
-                    );
-                }
-                if freelancer_amount > 0 {
-                    token_client.transfer(
-                        &env.current_contract_address(),
-                        &job.freelancer,
-                        &freelancer_amount,
-                    );
-                }
-                return;
-            }
-        }
-
-        // Default: no fee or fee is 0 or treasury not configured
-        token_client.transfer(
-            &env.current_contract_address(),
-            &job.freelancer,
-            &amount,
-        );
     }
 }
 
@@ -2842,6 +2797,54 @@ mod test {
 
         // Try to release again - no pending milestones, will fail with InvalidState
         cc.release_milestone(&1u64, &client);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_set_fee_config_rejects_fee_above_maximum() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.set_fee_config(&treasury, &(MAX_FEE_BPS + 1));
+    }
+
+    #[test]
+    fn test_release_milestone_large_amount_with_max_fee_does_not_overflow() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let agent_judge = Address::generate(&env);
+        let client = Address::generate(&env);
+        let freelancer = Address::generate(&env);
+        let treasury = Address::generate(&env);
+
+        let token_addr = setup_token(&env, &admin);
+        mint(&env, &token_addr, &client);
+
+        let contract_id = env.register_contract(None, EscrowContract);
+        let cc = EscrowContractClient::new(&env, &contract_id);
+
+        cc.initialize(&admin, &agent_judge);
+        cc.set_fee_config(&treasury, &MAX_FEE_BPS);
+
+        cc.create_job(&1u64, &client, &freelancer, &token_addr);
+        cc.add_milestone(&1u64, &10_000_000_000i128);
+        cc.deposit(&1u64, &10_000_000_000i128);
+
+        cc.release_milestone(&1u64, &client);
+
+        let job = cc.get_job(&1u64);
+        assert_eq!(job.released_amount, 10_000_000_000i128);
+        assert_eq!(job.status, EscrowStatus::Completed);
     }
 
     // ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
